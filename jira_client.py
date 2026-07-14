@@ -72,6 +72,44 @@ class JiraClient:
             "Accept": "application/json",
         }
         self._circuit = CircuitBreaker()
+        self._session: Optional[aiohttp.ClientSession] = None
+    async def _get_session(
+        self,
+    ) -> aiohttp.ClientSession:
+        if (
+            self._session is None
+            or self._session.closed
+        ):
+            self._session = aiohttp.ClientSession(
+                headers=self._headers,
+                timeout=aiohttp.ClientTimeout(
+                    total=CONFIG.JIRA_TIMEOUT
+                ),
+                connector=aiohttp.TCPConnector(
+                    limit=20,
+                    ttl_dns_cache=300,
+                ),
+            )
+
+            logger.info(
+                "jira: общая HTTP-сессия создана"
+            )
+
+        return self._session
+
+
+    async def close(self) -> None:
+        if (
+            self._session is not None
+            and not self._session.closed
+        ):
+            await self._session.close()
+
+            logger.info(
+                "jira: HTTP-сессия закрыта"
+            )
+
+        self._session = None
 
     async def _request(
         self,
@@ -105,19 +143,13 @@ class JiraClient:
 
         for attempt in range(1, retries + 1):
             try:
-                timeout = aiohttp.ClientTimeout(
-                    total=CONFIG.JIRA_TIMEOUT
-                )
+                session = await self._get_session()
 
-                async with aiohttp.ClientSession(
-                    timeout=timeout
-                ) as session:
-                    async with session.request(
-                        method,
-                        url,
-                        headers=self._headers,
-                        json=json_data,
-                    ) as resp:
+                async with session.request(
+                    method,
+                    url,
+                    json=json_data,
+                ) as resp:
                         text = await resp.text()
                         status = resp.status
 
