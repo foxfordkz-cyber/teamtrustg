@@ -174,24 +174,116 @@ class JiraClient:
         logger.info(f"jira: найдено {len(result)} тикетов за последние {days} дней")
         return result
 
-    async def search_user_issues(
+    async def search_recent_project_issues(
         self,
-        username: str,
         max_results: int = 5,
     ) -> List[Dict[str, Any]]:
-        """Последние тикеты проекта (для /list)."""
-        jql = f"project={CONFIG.JIRA_PROJECT_KEY} ORDER BY created DESC"
-        issues = await self._search(jql, ["summary", "status", "priority", "key"], max_results)
-        result = [
-            {
-                "key": i["key"],
-                "summary": i["fields"].get("summary", ""),
-                "status":  i["fields"].get("status", {}).get("name", "—"),
-                "priority": (i["fields"].get("priority") or {}).get("name", "Low"),
-            }
-            for i in issues
+        """
+        Возвращает последние тикеты всего проекта.
+
+        Используется администратором в команде /list.
+        """
+        safe_limit = max(1, min(int(max_results), 50))
+
+        jql = (
+            f"project={CONFIG.JIRA_PROJECT_KEY} "
+            f"ORDER BY created DESC"
+        )
+
+        issues = await self._search(
+            jql,
+            ["summary", "status", "priority", "key"],
+            safe_limit,
+        )
+
+        result = self._format_issue_list(issues)
+
+        logger.info(
+            "jira: найдено %s последних тикетов проекта",
+            len(result),
+        )
+        return result
+
+    async def search_issues_by_keys(
+        self,
+        issue_keys: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает данные только по переданным ключам тикетов.
+
+        Используется для отображения собственных тикетов сейлза.
+        """
+        clean_keys = [
+            str(key).strip().upper()
+            for key in issue_keys
+            if key and str(key).strip()
         ]
-        logger.info(f"jira: найдено {len(result)} тикетов для /list")
+
+        if not clean_keys:
+            return []
+
+        # Убираем повторы, сохраняя первоначальный порядок.
+        clean_keys = list(dict.fromkeys(clean_keys))[:50]
+
+        quoted_keys = ", ".join(
+            f'"{key}"'
+            for key in clean_keys
+        )
+
+        jql = (
+            f"project={CONFIG.JIRA_PROJECT_KEY} "
+            f"AND key IN ({quoted_keys})"
+        )
+
+        issues = await self._search(
+            jql,
+            ["summary", "status", "priority", "key"],
+            len(clean_keys),
+        )
+
+        result = self._format_issue_list(issues)
+
+        # Jira может вернуть элементы в другом порядке.
+        # Восстанавливаем порядок, полученный из SQLite.
+        order = {
+            key: index
+            for index, key in enumerate(clean_keys)
+        }
+
+        result.sort(
+            key=lambda issue: order.get(
+                issue.get("key", ""),
+                len(order),
+            )
+        )
+
+        logger.info(
+            "jira: найдено %s пользовательских тикетов",
+            len(result),
+        )
+        return result
+
+    def _format_issue_list(
+        self,
+        issues: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Преобразует Jira issues в единый формат для Telegram."""
+        result: List[Dict[str, Any]] = []
+
+        for issue in issues:
+            fields = issue.get("fields") or {}
+            status_data = fields.get("status") or {}
+            priority_data = fields.get("priority") or {}
+
+            result.append(
+                {
+                    "key": issue.get("key", ""),
+                    "summary": fields.get("summary", ""),
+                    "status": status_data.get("name", "—"),
+                    "priority": priority_data.get("name", "Low"),
+                }
+            )
+
         return result
 
     async def get_project_stats(self, days: int = 30) -> Dict[str, Any]:
