@@ -172,24 +172,66 @@ class LLMProvider(ABC):
         )
         await asyncio.sleep(delay)
 
+def _has_unclosed_json_string(text: str) -> bool:
+    """
+    Проверяет, осталась ли в JSON незакрытая строка.
+
+    Учитывает экранированные кавычки вида \\".
+    """
+    inside_string = False
+    escaped = False
+
+    for char in text:
+        if escaped:
+            escaped = False
+            continue
+
+        if char == "\\":
+            escaped = True
+            continue
+
+        if char == '"':
+            inside_string = not inside_string
+
+    return inside_string
 
 def _attempt_json_repairs(text: str) -> List[str]:
-    """Генерирует варианты починки обрезанного JSON."""
-    candidates = []
-    # Убрать хвостовую запятую
+    """
+    Генерирует безопасные варианты восстановления
+    обрезанного JSON-объекта.
+    """
     stripped = text.rstrip()
+    candidates: List[str] = []
+
+    # Убираем запятую в конце:
+    # {"name": "test",  →  {"name": "test"
     if stripped.endswith(","):
-        stripped = stripped[:-1]
-    # Вариант 1: закрыть строку и объект
-    candidates.append(stripped + '"}"' if not stripped.endswith("}") else stripped)
-    # Вариант 2: просто закрыть объект
-    if not stripped.endswith("}"):
-        candidates.append(stripped + "}")
-    # Вариант 3: отрезать последнее незакрытое поле
+        stripped = stripped[:-1].rstrip()
+
+    # Если объект уже закрыт, дополнительное исправление не требуется.
+    if stripped.endswith("}"):
+        return [stripped]
+
+    # Вариант 1: закрываем только объект.
+    candidates.append(stripped + "}")
+
+    # Вариант 2: если строка внутри JSON не закрыта,
+    # закрываем строку и затем объект.
+    if _has_unclosed_json_string(stripped):
+        candidates.append(stripped + '"}')
+
+    # Вариант 3: удаляем последнее повреждённое поле
+    # и закрываем объект на предыдущем корректном поле.
     last_comma = stripped.rfind(",")
+
     if last_comma > 0:
-        candidates.append(stripped[:last_comma] + "}")
-    return candidates
+        shortened = stripped[:last_comma].rstrip()
+
+        if shortened:
+            candidates.append(shortened + "}")
+
+    # Убираем одинаковые варианты, сохраняя порядок.
+    return list(dict.fromkeys(candidates))
 
 
 # ── Миксин для стандартных методов (OpenAI-совместимый формат) ───────────
