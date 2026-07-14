@@ -149,6 +149,45 @@ class StateManager:
             if not row or not row["username"]:
                 return None
             return row["username"].lstrip("@").lower()
+    def get_user_ticket_keys(
+        self,
+        username: str,
+        limit: int = 5,
+    ) -> List[str]:
+        """
+        Возвращает последние тикеты, созданные конкретным пользователем.
+    
+        Username хранится в нормализованном lowercase-виде.
+        """
+        normalized_username = (
+            username or ""
+        ).lstrip("@").lower()
+    
+        if not normalized_username:
+            return []
+    
+        safe_limit = max(1, min(int(limit), 50))
+    
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT issue_key
+                FROM tracked_tickets
+                WHERE LOWER(username) = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (
+                    normalized_username,
+                    safe_limit,
+                ),
+            ).fetchall()
+    
+        return [
+            row[0]
+            for row in rows
+            if row and row[0]
+        ]
 
     def get_tracked_tickets(self) -> List[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
