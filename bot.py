@@ -250,7 +250,7 @@ def _build_stats_message(local: dict, jira: dict | None) -> str:
     parts = ["📈 *Статистика TeamTrustGate*\n"]
     parts.append(
         f"*За последние 30 дней:*\n"
-        f"📋 Создано тикетов: *{local['this_month']}*\n"
+        f"📋 Создано тикетов: *{local['last_30_days']}*\n"
         f"📦 Всего через бота: *{local['total']}*"
     )
     if jira:
@@ -278,7 +278,8 @@ def _build_stats_message(local: dict, jira: dict | None) -> str:
         parts.append("\n".join(rows))
     if local.get("failed", 0) > 0:
         parts.append(
-            f"\n⚠️ Упавших запросов: *{local['failed_month']}* за месяц "
+            f"\n⚠️ Упавших запросов: *{local['failed_30_days']}* "
+            f"за последние 30 дней "
             f"(*{local['failed']}* всего)"
         )
     return "\n".join(parts)
