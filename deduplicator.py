@@ -78,7 +78,8 @@ class Deduplicator:
             logger.info("dedup: дубликатов не найдено")
             return None
 
-        # Возвращаем первый найденный дубликат (с наибольшим приоритетом в списке)
+        # Кандидаты отсортированы Jira по created DESC,
+        # поэтому возвращаем самый новый найденный дубликат.
         key_set = set(found_keys)
         for ticket in candidates:
             if ticket["key"] in key_set:
