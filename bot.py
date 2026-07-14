@@ -412,19 +412,28 @@ async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
         else:
             STATE_MANAGER.update_ticket_status(issue_key, current_status)
 
-def _admin_chat_ids() -> list:
+def _admin_chat_ids() -> list[int]:
     """
-    Возвращает chat_id всех админов, которые писали боту.
-    Берём из tracked_tickets: ищем владельцев-админов.
+    Возвращает chat_id зарегистрированных администраторов.
+
+    Дополнительно проверяет, что пользователь всё ещё
+    находится в ADMIN_USERNAMES.
     """
-    seen = set()
-    result = []
-    for t in STATE_MANAGER.get_tracked_tickets():
-        uname = t.get("username") or ""
-        cid = t.get("chat_id")
-        if cid and cid not in seen and _is_admin(uname):
-            seen.add(cid)
-            result.append(cid)
+    result: list[int] = []
+    seen: set[int] = set()
+
+    for admin in STATE_MANAGER.get_registered_admin_chats():
+        chat_id = admin.get("chat_id")
+        username = admin.get("username") or ""
+
+        # Проверяем актуальные права через текущий config
+        if not _is_admin(username):
+            continue
+
+        if chat_id and chat_id not in seen:
+            seen.add(chat_id)
+            result.append(chat_id)
+
     return result
 
 async def _check_sla(context: ContextTypes.DEFAULT_TYPE):
@@ -694,14 +703,47 @@ async def _handle_transition(query, issue_key: str, transition_type: str, userna
         )
 
 # ── Command handlers ───────────────────────────────────────────────────────
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     user = update.effective_user
+
     if not _is_allowed(user.username or ""):
-        await update.message.reply_text("❌ Доступ ограничен.")
+        await update.message.reply_text(
+            "❌ Доступ ограничен."
+        )
         return
 
     is_admin = _is_admin(user.username or "")
-    role_line = "👑 Роль: *Администратор*" if is_admin else "👤 Роль: *Сейлз*"
+
+    if is_admin:
+        admin_username = (
+            user.username
+            or user.first_name
+            or str(user.id)
+        )
+
+        STATE_MANAGER.register_admin_chat(
+            chat_id=update.effective_chat.id,
+            username=admin_username,
+        )
+
+        logger.info(
+            "admin chat registered: username=%s chat_id=%s",
+            _norm(admin_username),
+            update.effective_chat.id,
+        )
+
+    role_line = (
+        "👑 Роль: *Администратор*"
+        if is_admin
+        else "👤 Роль: *Сейлз*"
+    )
+
+    
+
+
 
     base_commands = (
         "/start — начать\n"
