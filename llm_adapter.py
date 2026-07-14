@@ -108,12 +108,23 @@ class LLMProvider(ABC):
         except json.JSONDecodeError:
             pass
 
-        # Ищем JSON-объект внутри текста
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise ValueError(f"JSON не найден в ответе LLM: {text[:200]}")
+        # Ищем начало JSON-объекта.
+        start = text.find("{")
 
-        candidate = match.group()
+        if start == -1:
+            raise ValueError(
+                f"JSON не найден в ответе LLM: {text[:200]}"
+            )
+
+        # Если закрывающая скобка есть — берём объект целиком.
+        # Если ответ обрезан — берём текст от первой {
+        # и пробуем восстановить JSON ниже.
+        end = text.rfind("}")
+
+        if end >= start:
+            candidate = text[start:end + 1]
+        else:
+            candidate = text[start:]
 
         # Прямой парсинг найденного фрагмента
         try:
