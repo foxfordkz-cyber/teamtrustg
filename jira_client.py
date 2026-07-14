@@ -345,25 +345,60 @@ class JiraClient:
     async def search_recent_issues(
         self,
         days: int = CONFIG.DEDUP_DAYS,
-        max_results: int = 50,
+        max_results: int = 200,
     ) -> List[Dict[str, Any]]:
-        """Недавние открытые тикеты проекта для дедупликации."""
+        """
+        Возвращает недавние открытые тикеты проекта
+        для проверки дубликатов.
+
+        По умолчанию анализируется до 200 тикетов.
+        """
+        safe_limit = max(
+            1,
+            min(int(max_results), 500),
+        )
+
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f"AND created >= -{days}d "
-            f"AND status != Done "
+            f"AND statusCategory != Done "
             f"ORDER BY created DESC"
         )
-        issues = await self._search(jql, ["summary", "description", "key"], max_results)
+
+        issues = await self._search(
+            jql,
+            [
+                "summary",
+                "description",
+                "key",
+            ],
+            safe_limit,
+        )
+
         result = [
             {
-                "key": i["key"],
-                "summary": i["fields"].get("summary", ""),
-                "description": self._extract_desc(i["fields"].get("description")),
+                "key": issue.get("key", ""),
+                "summary": (
+                    issue.get("fields") or {}
+                ).get("summary", ""),
+                "description": self._extract_desc(
+                    (issue.get("fields") or {}).get(
+                        "description"
+                    )
+                ),
             }
-            for i in issues
+            for issue in issues
         ]
-        logger.info(f"jira: найдено {len(result)} тикетов за последние {days} дней")
+
+        logger.info(
+            "jira: для дедупликации получено "
+            "%s тикетов за последние %s дней "
+            "(лимит=%s)",
+            len(result),
+            days,
+            safe_limit,
+        )
+
         return result
 
     async def search_recent_project_issues(
