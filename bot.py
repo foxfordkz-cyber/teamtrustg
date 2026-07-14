@@ -841,15 +841,14 @@ async def list_handler(
                     max_results=5,
                 )
             )
-
         except Exception as error:
             logger.warning(
                 "list: ошибка получения тикетов проекта: %s",
                 error,
             )
-
             await update.message.reply_text(
-                "❌ Не удалось получить список тикетов."
+                f"❌ Не удалось получить список тикетов: "
+                f"{_escape_md(str(error)[:200])}"
             )
             return
 
@@ -860,11 +859,9 @@ async def list_handler(
             "🔍 Ищу твои последние тикеты..."
         )
 
-        ticket_keys = (
-            STATE_MANAGER.get_user_ticket_keys(
-                username=_norm(username),
-                limit=5,
-            )
+        ticket_keys = STATE_MANAGER.get_user_ticket_keys(
+            username=_norm(username),
+            limit=5,
         )
 
         if not ticket_keys:
@@ -877,15 +874,14 @@ async def list_handler(
             issues = await JIRA_CLIENT.search_issues_by_keys(
                 ticket_keys
             )
-
         except Exception as error:
             logger.warning(
-                "list: ошибка получения пользовательских тикетов: %s",
+                "list: ошибка получения тикетов пользователя: %s",
                 error,
             )
-
             await update.message.reply_text(
-                "❌ Не удалось получить твои тикеты."
+                f"❌ Не удалось получить твои тикеты: "
+                f"{_escape_md(str(error)[:200])}"
             )
             return
 
@@ -1129,54 +1125,80 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = base + (admin_commands if is_admin else sales_commands)
     await update.message.reply_text(text)
 
-async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Диагностика Jira API. Только для админов. Показывает сырой ответ."""
+async def debug_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """
+    Проверяет подключение к Jira через актуальный
+    POST /rest/api/3/search/jql.
+    """
     user = update.effective_user
+
     if not _is_admin(user.username or ""):
-        await update.message.reply_text("\u274c Только для админов.")
+        await update.message.reply_text(
+            "❌ Только для админов."
+        )
         return
 
-    await update.message.reply_text("\U0001f50d Тестирую Jira API напрямую...")
+    await update.message.reply_text(
+        "🔍 Проверяю подключение к Jira..."
+    )
 
-    # Тест 1: простейший запрос — все тикеты проекта без фильтров
-    from urllib.parse import quote
-    jql = f"project={CONFIG.JIRA_PROJECT_KEY} ORDER BY created DESC"
-    endpoint = f"/search?jql={quote(jql, safe='')}&fields=summary,key&maxResults=5"
-
-    report = ["\U0001f527 *DEBUG: Jira API*\n"]
-    report.append(f"*PROJECT_KEY:* `{CONFIG.JIRA_PROJECT_KEY}`")
-    report.append(f"*JIRA_URL:* `{CONFIG.JIRA_URL}`")
-    report.append(f"*base_url:* `{JIRA_CLIENT.base_url}`")
-    report.append(f"*JQL:* `{jql}`\n")
+    report = [
+        "🔧 *DEBUG: Jira API*\n",
+        f"*PROJECT_KEY:* `{CONFIG.JIRA_PROJECT_KEY}`",
+        f"*JIRA_URL:* `{CONFIG.JIRA_URL}`",
+        f"*Search API:* `POST /rest/api/3/search/jql`",
+    ]
 
     try:
-        status, text = await JIRA_CLIENT._request("GET", endpoint)
-        report.append(f"*HTTP статус:* `{status}`")
+        issues = (
+            await JIRA_CLIENT.search_recent_project_issues(
+                max_results=5,
+            )
+        )
 
-        try:
-            data = json.loads(text)
-            total = data.get("total", "нет поля total")
-            issues = data.get("issues", [])
-            report.append(f"*total:* `{total}`")
-            report.append(f"*issues в ответе:* `{len(issues)}`")
+        report.append("\n✅ *Подключение успешно*")
+        report.append(
+            f"*Получено тикетов:* `{len(issues)}`"
+        )
 
-            if issues:
-                report.append("\n*Найденные тикеты:*")
-                for i in issues[:5]:
-                    report.append(f"  • {i.get('key')} — {i.get('fields', {}).get('summary', '')[:40]}")
-            else:
-                # Показываем сырой ответ если тикетов нет
-                report.append(f"\n*Сырой ответ (первые 500):*\n`{text[:500]}`")
-        except json.JSONDecodeError:
-            report.append(f"\n*Не JSON. Сырой ответ:*\n`{text[:500]}`")
+        if issues:
+            report.append("\n*Последние тикеты:*")
 
-    except Exception as e:
-        report.append(f"\n\u274c *Ошибка запроса:*\n`{str(e)[:400]}`")
+            for issue in issues:
+                issue_key = issue.get("key", "—")
+                summary = issue.get("summary", "")
+                status = issue.get("status", "—")
 
-    msg = "\n".join(report)
-    # Telegram лимит 4096
-    await update.message.reply_text(msg[:4000])
+                report.append(
+                    f"• `{issue_key}` — "
+                    f"{_escape_md(summary[:50])}\n"
+                    f"  Статус: "
+                    f"_{_escape_md(status)}_"
+                )
+        else:
+            report.append(
+                "\nℹ️ Jira ответила успешно, "
+                "но в проекте нет доступных тикетов."
+            )
 
+    except Exception as error:
+        logger.exception(
+            "debug: ошибка проверки Jira API"
+        )
+
+        report.append("\n❌ *Ошибка Jira API*")
+        report.append(
+            f"`{_escape_md(str(error)[:500])}`"
+        )
+
+    message = "\n".join(report)
+
+    await update.message.reply_text(
+        message[:4000]
+    )
 # ── Message handler ────────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user     = update.effective_user
