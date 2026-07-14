@@ -90,7 +90,7 @@ def _is_admin(username: str) -> bool:
     if not CONFIG.ADMIN_USERNAMES:
         return False  # список пуст — никто не админ
     return _norm(username) in CONFIG.ADMIN_USERNAMES
-def _can_access_ticket(
+async def _can_access_ticket(
     username: str,
     issue_key: str,
 ) -> bool:
@@ -104,8 +104,9 @@ def _can_access_ticket(
     if _is_admin(username):
         return True
 
-    owner = STATE_MANAGER.get_ticket_owner(
-        issue_key
+    owner = await asyncio.to_thread(
+        STATE_MANAGER.get_ticket_owner,
+        issue_key,
     )
 
     if not owner:
@@ -390,72 +391,138 @@ _TRANSITION_LABELS = {
 }
 
 # ── Background job ─────────────────────────────────────────────────────────
-async def _poll_status_changes(context: ContextTypes.DEFAULT_TYPE):
-    tracked = STATE_MANAGER.get_tracked_tickets()
+async def _poll_status_changes(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    tracked = await asyncio.to_thread(
+        STATE_MANAGER.get_tracked_tickets
+    )
+
     if not tracked:
         return
 
-    logger.info(f"poll: проверяю {len(tracked)} отслеживаемых тикетов")
+    logger.info(
+        "poll: проверяю %s отслеживаемых тикетов",
+        len(tracked),
+    )
 
     for ticket in tracked:
-        issue_key   = ticket["issue_key"]
-        chat_id     = ticket["chat_id"]
+        issue_key = ticket["issue_key"]
+        chat_id = ticket["chat_id"]
         last_status = ticket["last_status"]
 
         try:
             _, text = await JIRA_CLIENT._request(
-                "GET", f"/issue/{issue_key}?fields=status,summary"
+                "GET",
+                f"/issue/{issue_key}?fields=status,summary",
             )
-            d              = json.loads(text)
-            current_status = d["fields"]["status"]["name"]
-            summary        = d["fields"]["summary"]
-        except Exception as e:
-            if "404" in str(e):
-                logger.info(f"poll: тикет {issue_key} не найден, перестаём отслеживать")
-                STATE_MANAGER.untrack_ticket(issue_key)
+
+            data = json.loads(text)
+
+            current_status = (
+                data["fields"]["status"]["name"]
+            )
+
+            summary = data["fields"]["summary"]
+
+        except Exception as error:
+            if "404" in str(error):
+                logger.info(
+                    "poll: тикет %s не найден, "
+                    "перестаём отслеживать",
+                    issue_key,
+                )
+
+                await asyncio.to_thread(
+                    STATE_MANAGER.untrack_ticket,
+                    issue_key,
+                )
             else:
-                logger.warning(f"poll: ошибка проверки {issue_key}: {e}")
+                logger.warning(
+                    "poll: ошибка проверки %s: %s",
+                    issue_key,
+                    error,
+                )
+
             continue
 
-        if last_status and current_status != last_status:
+        if (
+            last_status
+            and current_status != last_status
+        ):
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"📬 *Обновление по тикету [{issue_key}]"
-                        f"({CONFIG.JIRA_URL}/browse/{issue_key})*\n\n"
+                        f"📬 *Обновление по тикету "
+                        f"[{issue_key}]"
+                        f"({CONFIG.JIRA_URL}/browse/"
+                        f"{issue_key})*\n\n"
                         f"Статус изменился:\n"
-                        f"_{_escape_md(last_status)}_ → *{_escape_md(current_status)}*\n\n"
+                        f"_{_escape_md(last_status)}_ → "
+                        f"*{_escape_md(current_status)}*\n\n"
                         f"📋 {_escape_md(summary[:80])}"
                     ),
                     parse_mode="Markdown",
                 )
-                logger.info(f"poll: уведомление отправлено {issue_key} {last_status}→{current_status}")
-            except Exception as e:
-                logger.warning(f"poll: не удалось отправить уведомление для {issue_key}: {e}")
 
-            if current_status.lower() in ("done", "готово", "closed", "resolved", "отклонено"):
-                STATE_MANAGER.untrack_ticket(issue_key)
+                logger.info(
+                    "poll: уведомление отправлено "
+                    "%s %s→%s",
+                    issue_key,
+                    last_status,
+                    current_status,
+                )
+
+            except Exception as error:
+                logger.warning(
+                    "poll: не удалось отправить "
+                    "уведомление для %s: %s",
+                    issue_key,
+                    error,
+                )
+
+            if current_status.lower() in (
+                "done",
+                "готово",
+                "closed",
+                "resolved",
+                "отклонено",
+            ):
+                await asyncio.to_thread(
+                    STATE_MANAGER.untrack_ticket,
+                    issue_key,
+                )
             else:
-                STATE_MANAGER.update_ticket_status(issue_key, current_status)
+                await asyncio.to_thread(
+                    STATE_MANAGER.update_ticket_status,
+                    issue_key,
+                    current_status,
+                )
+
         else:
-            STATE_MANAGER.update_ticket_status(issue_key, current_status)
+            await asyncio.to_thread(
+                STATE_MANAGER.update_ticket_status,
+                issue_key,
+                current_status,
+            )
 
-def _admin_chat_ids() -> list[int]:
+async def _admin_chat_ids() -> list[int]:
     """
-    Возвращает chat_id зарегистрированных администраторов.
+    Возвращает chat_id зарегистрированных
+    администраторов.
+    """
+    registered_admins = await asyncio.to_thread(
+        STATE_MANAGER.get_registered_admin_chats
+    )
 
-    Дополнительно проверяет, что пользователь всё ещё
-    находится в ADMIN_USERNAMES.
-    """
     result: list[int] = []
     seen: set[int] = set()
 
-    for admin in STATE_MANAGER.get_registered_admin_chats():
+    for admin in registered_admins:
         chat_id = admin.get("chat_id")
         username = admin.get("username") or ""
 
-        # Проверяем актуальные права через текущий config
         if not _is_admin(username):
             continue
 
@@ -472,7 +539,7 @@ async def _check_sla(context: ContextTypes.DEFAULT_TYPE):
     - Дедлайн (duedate) приближается (≤SLA_DEADLINE_WARN_DAYS), а тикет не в работе
     Каждый алерт отправляется один раз (защита через sent_alerts).
     """
-    admin_ids = _admin_chat_ids()
+    admin_ids = await _admin_chat_ids()
     if not admin_ids:
         logger.info("sla: нет известных админов для алертов, пропускаю")
         return
@@ -505,7 +572,13 @@ async def _check_sla(context: ContextTypes.DEFAULT_TYPE):
                 days_stale = 0
 
             if days_stale >= SLA_STALE_DAYS:
-                if not STATE_MANAGER.was_alert_sent(issue_key, "stale"):
+                stale_alert_sent = await asyncio.to_thread(
+                    STATE_MANAGER.was_alert_sent,
+                    issue_key,
+                    "stale",
+                )
+
+                if not stale_alert_sent:
                     emoji = _priority_emoji(priority)
                     msg = (
                         f"🚨 *SLA: тикет завис без движения*\n\n"
@@ -520,15 +593,27 @@ async def _check_sla(context: ContextTypes.DEFAULT_TYPE):
                             await context.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
                         except Exception as e:
                             logger.warning(f"sla: не доставлено {cid}: {e}")
-                    STATE_MANAGER.mark_alert_sent(issue_key, "stale")
+                    await asyncio.to_thread(
+                        STATE_MANAGER.mark_alert_sent,
+                        issue_key,
+                        "stale",
+                    )
                     alerts_sent += 1
                     logger.info(f"sla: stale-алерт {issue_key} ({days_stale}д)")
             else:
                 # тикет ещё свежий — сбрасываем возможную старую отметку
-                STATE_MANAGER.clear_alert(issue_key, "stale")
+                await asyncio.to_thread(
+                    STATE_MANAGER.clear_alert,
+                    issue_key,
+                    "stale",
+                )
         else:
             # тикет уже в работе или не важный — снимаем stale-алерт
-            STATE_MANAGER.clear_alert(issue_key, "stale")
+            await asyncio.to_thread(
+                STATE_MANAGER.clear_alert,
+                issue_key,
+                "stale",
+            )
 
         # ── Алерт 2: приближается дедлайн, а работа не началась ──
         if duedate and is_todo:
@@ -539,7 +624,13 @@ async def _check_sla(context: ContextTypes.DEFAULT_TYPE):
                 days_left = 999
 
             if days_left <= SLA_DEADLINE_WARN_DAYS:
-                if not STATE_MANAGER.was_alert_sent(issue_key, "deadline"):
+                deadline_alert_sent = await asyncio.to_thread(
+                    STATE_MANAGER.was_alert_sent,
+                    issue_key,
+                    "deadline",
+                )
+
+                if not deadline_alert_sent:
                     when = "просрочен" if days_left < 0 else (
                         "сегодня" if days_left == 0 else f"через {days_left} дн."
                     )
@@ -557,12 +648,20 @@ async def _check_sla(context: ContextTypes.DEFAULT_TYPE):
                             await context.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
                         except Exception as e:
                             logger.warning(f"sla: не доставлено {cid}: {e}")
-                    STATE_MANAGER.mark_alert_sent(issue_key, "deadline")
+                    await asyncio.to_thread(
+                        STATE_MANAGER.mark_alert_sent,
+                        issue_key,
+                        "deadline",
+                    )
                     alerts_sent += 1
                     logger.info(f"sla: deadline-алерт {issue_key} ({days_left}д)")
         else:
             # дедлайна нет или тикет в работе — снимаем deadline-алерт
-            STATE_MANAGER.clear_alert(issue_key, "deadline")
+            await asyncio.to_thread(
+                STATE_MANAGER.clear_alert,
+                issue_key,
+                "deadline",
+            )
 
     logger.info(f"sla: проверка завершена, отправлено {alerts_sent} алертов")
 
@@ -577,7 +676,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or user.first_name or str(user.id)
 
     if data == "preview:confirm":
-        session = STATE_MANAGER.get_session(chat_id)
+        session = await asyncio.to_thread(
+            STATE_MANAGER.get_session,
+            chat_id,
+        )
         if not session or session.get("state") != "awaiting_confirmation":
             await query.message.reply_text("⚠️ Сессия устарела. Отправь запрос заново.")
             return
@@ -586,12 +688,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _create_confirmed_ticket(query.message, chat_id, session, username)
 
     elif data == "preview:clarify":
-        session = STATE_MANAGER.get_session(chat_id)
+        session = await asyncio.to_thread(
+            STATE_MANAGER.get_session,
+            chat_id,
+        )
         if not session:
             await query.message.reply_text("⚠️ Сессия устарела. Отправь запрос заново.")
             return
-        STATE_MANAGER.update_session(
-            chat_id, "clarifying",
+        await asyncio.to_thread(
+            STATE_MANAGER.update_session,
+            chat_id,
+            "clarifying",
             session.get("collected_answers", []),
             session.get("round", 0),
             session.get("analysis_json"),
@@ -602,7 +709,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "preview:cancel":
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         await query.message.edit_reply_markup(reply_markup=None)
         await query.message.reply_text("🚫 Создание тикета отменено.")
 
@@ -620,7 +730,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("status:"):
         issue_key = data.split(":", 1)[1]
 
-        if not _can_access_ticket(
+        if not await _can_access_ticket(
             username,
             issue_key,
         ):
@@ -672,7 +782,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             await JIRA_CLIENT.delete_issue(issue_key)
-            STATE_MANAGER.untrack_ticket(issue_key)
+
+            await asyncio.to_thread(
+                STATE_MANAGER.untrack_ticket,
+                issue_key,
+            )
             logger.info(f"ticket_deleted key={issue_key} by={username}")
             await query.message.edit_text(f"🗑 Тикет *{issue_key}* удалён.")
         except Exception as e:
@@ -686,7 +800,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("comment:"):
            issue_key = data.split(":", 1)[1]
 
-           if not _can_access_ticket(
+           if not await _can_access_ticket(
                username,
                issue_key,
            ):
@@ -697,12 +811,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                return
 
            # Запоминаем, что бот ждёт текст комментария.
-           STATE_MANAGER.create_session(
+           await asyncio.to_thread(
+               STATE_MANAGER.create_session,
                chat_id,
                "",
            )
 
-           STATE_MANAGER.update_session(
+           await asyncio.to_thread(
+               STATE_MANAGER.update_session,
                chat_id,
                "awaiting_comment",
                [],
@@ -747,7 +863,11 @@ async def _handle_transition(query, issue_key: str, transition_type: str, userna
             "POST", f"/issue/{issue_key}/transitions",
             {"transition": {"id": transition_id}},
         )
-        STATE_MANAGER.update_ticket_status(issue_key, matched_name)
+        await asyncio.to_thread(
+            STATE_MANAGER.update_ticket_status,
+            issue_key,
+            matched_name,
+        )
 
         label = _TRANSITION_LABELS.get(transition_type, transition_type)
         logger.info(f"transition applied key={issue_key} type={transition_type} by={username}")
@@ -786,7 +906,8 @@ async def start_handler(
             or str(user.id)
         )
 
-        STATE_MANAGER.register_admin_chat(
+        await asyncio.to_thread(
+            STATE_MANAGER.register_admin_chat,
             chat_id=update.effective_chat.id,
             username=admin_username,
         )
@@ -837,7 +958,10 @@ async def start_handler(
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    STATE_MANAGER.clear_session(chat_id)
+    await asyncio.to_thread(
+        STATE_MANAGER.clear_session,
+        chat_id,
+    )
     await update.message.reply_text("🚫 Сессия отменена. Отправь новый запрос.")
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -852,7 +976,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     issue_key = args[0].upper()
 
-    if not _can_access_ticket(
+    if not await _can_access_ticket(
         username,
         issue_key,
     ):
@@ -931,7 +1055,8 @@ async def list_handler(
             "🔍 Ищу твои последние тикеты..."
         )
 
-        ticket_keys = STATE_MANAGER.get_user_ticket_keys(
+        ticket_keys = await asyncio.to_thread(
+            STATE_MANAGER.get_user_ticket_keys,
             username=_norm(username),
             limit=5,
         )
@@ -1290,7 +1415,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, отправьте текстовое описание запроса.")
         return
 
-    session = STATE_MANAGER.get_session(chat_id)
+    session = await asyncio.to_thread(
+        STATE_MANAGER.get_session,
+        chat_id,
+    )
 
     if session and session["state"] == "clarifying":
         await _handle_clarification(update, chat_id, text, username, session)
@@ -1311,7 +1439,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     logger.info(f"request_received chat_id={chat_id} msg_len={len(text)}")
-    STATE_MANAGER.create_session(chat_id, text)
+    await asyncio.to_thread(
+        STATE_MANAGER.create_session,
+        chat_id,
+        text,
+    )
     await _process_request(update, chat_id, text, username, collected_answers=[])
 
 # ── Core logic ─────────────────────────────────────────────────────────────
@@ -1321,14 +1453,20 @@ async def _handle_comment(update, chat_id, text, username, session):
     issue_key = data.get("comment_issue_key")
 
     if not issue_key:
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         await update.message.reply_text("⚠️ Не понял к какому тикету комментарий. Попробуй ещё раз.")
         return
-    if not _can_access_ticket(
+    if not await _can_access_ticket(
         username,
         issue_key,
     ):
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
 
         await update.message.reply_text(
             "❌ У тебя нет доступа к этому тикету."
@@ -1342,13 +1480,19 @@ async def _handle_comment(update, chat_id, text, username, session):
         await JIRA_CLIENT.add_comment(issue_key, comment_text)
     except Exception as e:
         logger.error(f"comment_add_error: {e}")
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         await update.message.reply_text(
             f"❌ Не удалось добавить комментарий: {_escape_md(str(e)[:200])}"
         )
         return
 
-    STATE_MANAGER.clear_session(chat_id)
+    await asyncio.to_thread(
+        STATE_MANAGER.clear_session,
+        chat_id,
+    )
     logger.info(f"comment_added key={issue_key} by={username}")
     await update.message.reply_text(
         f"✅ Комментарий добавлен к тикету *{issue_key}*.",
@@ -1377,7 +1521,10 @@ async def _handle_clarification(update, chat_id, text, username, session):
     should_reject = analysis.get("should_reject", False)
 
     if should_reject:
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         reason = analysis.get("reject_reason", "Запрос отклонён.")
         await update.message.reply_text(f"❌ *Запрос отклонён.*\nПричина: {_escape_md(reason)}")
         return
@@ -1388,7 +1535,14 @@ async def _handle_clarification(update, chat_id, text, username, session):
     else:
         missing = analysis.get("missing_info", [])
         if missing:
-            STATE_MANAGER.update_session(chat_id, "clarifying", collected, round_num, analysis)
+            await asyncio.to_thread(
+                STATE_MANAGER.update_session,
+                chat_id,
+                "clarifying",
+                collected,
+                round_num,
+                analysis,
+            )
             await update.message.reply_text(f"❓ {_escape_md(missing[0])}")
         else:
             await _show_preview(update, chat_id, analysis, username, original, collected, False, round_num)
@@ -1409,7 +1563,10 @@ async def _process_request(update, chat_id, text, username, collected_answers):
     should_reject = analysis.get("should_reject", False)
 
     if should_reject:
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         reason = analysis.get("reject_reason", "Запрос отклонён.")
         await update.message.reply_text(f"❌ *Запрос отклонён.*\nПричина: {_escape_md(reason)}")
         return
@@ -1417,7 +1574,14 @@ async def _process_request(update, chat_id, text, username, collected_answers):
     if confidence < CONFIG.CONFIDENCE_THRESHOLD:
         missing = analysis.get("missing_info", [])
         if missing:
-            STATE_MANAGER.update_session(chat_id, "clarifying", collected_answers, 1, analysis)
+            await asyncio.to_thread(
+                STATE_MANAGER.update_session,
+                chat_id,
+                "clarifying",
+                collected_answers,
+                1,
+                analysis,
+            )
             await update.message.reply_text(f"❓ {_escape_md(missing[0])}")
             return
 
@@ -1440,7 +1604,10 @@ async def _show_preview(update, chat_id, analysis, username, raw_text, collected
             )
         except Exception as e:
             logger.error(f"comment_error: {e}")
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         await update.message.reply_text(
             f"⚠️ *Этот запрос уже есть в бэклоге:* "
             f"[{dup['key']}]({CONFIG.JIRA_URL}/browse/{dup['key']})\n"
@@ -1456,14 +1623,19 @@ async def _show_preview(update, chat_id, analysis, username, raw_text, collected
         logger.error(f"scoring_error: {e}")
         scoring = {"total_score": 0, "priority": "Low", "justification": "Scoring failed"}
 
-    STATE_MANAGER.update_session(
-        chat_id, "awaiting_confirmation", collected_answers, round_num, {
+    await asyncio.to_thread(
+        STATE_MANAGER.update_session,
+        chat_id,
+        "awaiting_confirmation",
+        collected_answers,
+        round_num,
+        {
             "analysis": analysis,
             "scoring":  scoring,
             "raw_text": raw_text,
             "username": username,
             "forced":   forced,
-        }
+        },
     )
 
     await update.message.reply_text(
@@ -1490,17 +1662,36 @@ async def _create_confirmed_ticket(message, chat_id, session, username):
         issue = await JIRA_CLIENT.create_issue(summary, description, priority, labels, due_date=due_date)
     except Exception as e:
         logger.error(f"jira_create_error: {e}")
-        STATE_MANAGER.save_failed_request(chat_id, username, raw_text, analysis, str(e))
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.save_failed_request,
+            chat_id,
+            username,
+            raw_text,
+            analysis,
+            str(e),
+        )
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         await message.reply_text(
-            f"⚠️ Jira временно недоступна. Запрос сохранён, повторим позже.\n"
+            f"Jira временно недоступна. Запрос сохранён в журнале ошибок."
             f"Ошибка: {_escape_md(str(e)[:200])}"
         )
         return
 
-    STATE_MANAGER.clear_session(chat_id)
+    await asyncio.to_thread(
+        STATE_MANAGER.clear_session,
+        chat_id,
+    )
     # Сохраняем владельца (нормализованный username) для проверки прав
-    STATE_MANAGER.track_ticket(issue["key"], chat_id, _norm(username), status="")
+    await asyncio.to_thread(
+        STATE_MANAGER.track_ticket,
+        issue["key"],
+        chat_id,
+        _norm(username),
+        status="",
+    )
     logger.info(f"ticket_created key={issue['key']} priority={priority} score={scoring.get('total_score', 0)}")
 
     deadline_line = f"*Срок:* {_deadline_label(due_date)}\n" if due_date else ""
@@ -1525,16 +1716,35 @@ async def _create_raw_ticket(update, chat_id, text, username, error_msg):
             "Low",
             ["teamtrustgate", "raw-request", "sales-request"],
         )
-        STATE_MANAGER.clear_session(chat_id)
-        STATE_MANAGER.track_ticket(issue["key"], chat_id, _norm(username), status="")
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
+        await asyncio.to_thread(
+            STATE_MANAGER.track_ticket,
+            issue["key"],
+            chat_id,
+            _norm(username),
+            status="",
+        )
         await update.message.reply_text(
             f"✅ *Сырой тикет создан:* [{issue['key']}]({issue['url']})\n"
             f"Продуктовая команда рассмотрит запрос вручную.",
             reply_markup=_ticket_keyboard(issue["key"], is_admin=_is_admin(username)),
         )
     except Exception as e:
-        STATE_MANAGER.save_failed_request(chat_id, username, text, None, str(e))
-        STATE_MANAGER.clear_session(chat_id)
+        await asyncio.to_thread(
+            STATE_MANAGER.save_failed_request,
+            chat_id,
+            username,
+            text,
+            None,
+            str(e),
+        )
+        await asyncio.to_thread(
+            STATE_MANAGER.clear_session,
+            chat_id,
+        )
         await update.message.reply_text(
             f"❌ Не удалось создать тикет. "
             f"Запрос сохранён в журнале ошибок.\n"
