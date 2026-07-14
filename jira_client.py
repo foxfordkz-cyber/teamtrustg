@@ -16,7 +16,6 @@ from config import CONFIG
 
 logger = logging.getLogger("teamtrustgate")
 
-_NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 410}
 
 _PRIORITY_MAP = {
     "Highest": "Highest",
@@ -83,55 +82,135 @@ class JiraClient:
         base: Optional[str] = None,
     ) -> tuple[int, str]:
         """
-        Универсальный запрос к Jira.
-        base — переопределение base_url (для поиска используем search_base).
+        Выполняет HTTP-запрос к Jira.
+
+        Повторяются:
+        - сетевые ошибки;
+        - timeout;
+        - HTTP 429;
+        - HTTP 5xx.
+
+        Остальные HTTP 4xx считаются постоянными ошибками
+        и не повторяются.
         """
         if self._circuit.is_open():
             raise RuntimeError(
-                "Jira circuit breaker активен — сервис временно недоступен. "
+                "Jira circuit breaker активен — "
+                "сервис временно недоступен. "
                 "Попробуйте через несколько минут."
             )
 
         url = f"{base or self.base_url}{endpoint}"
         last_err: Optional[Exception] = None
 
-        for attempt in range(retries):
+        for attempt in range(1, retries + 1):
             try:
-                timeout = aiohttp.ClientTimeout(total=CONFIG.JIRA_TIMEOUT)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                timeout = aiohttp.ClientTimeout(
+                    total=CONFIG.JIRA_TIMEOUT
+                )
+
+                async with aiohttp.ClientSession(
+                    timeout=timeout
+                ) as session:
                     async with session.request(
-                        method, url, headers=self._headers, json=json_data
+                        method,
+                        url,
+                        headers=self._headers,
+                        json=json_data,
                     ) as resp:
                         text = await resp.text()
+                        status = resp.status
 
-                        if resp.status in _NON_RETRYABLE_STATUSES:
-                            raise RuntimeError(
-                                f"Jira {resp.status}: {_status_message(resp.status, text)}"
+                        # Любой успешный HTTP-ответ.
+                        if 200 <= status < 300:
+                            self._circuit.record_success()
+
+                            logger.debug(
+                                "jira: %s %s → %s",
+                                method,
+                                endpoint,
+                                status,
                             )
 
-                        if 500 <= resp.status < 600:
+                            return status, text
+
+                        error = RuntimeError(
+                            f"Jira {status}: "
+                            f"{_status_message(status, text)}"
+                        )
+
+                        # 429 и 5xx считаются временными.
+                        is_retryable = (
+                            status == 429
+                            or 500 <= status < 600
+                        )
+
+                        if not is_retryable:
+                            # 400, 401, 403, 404, 409,
+                            # 410, 422 и остальные 4xx
+                            # повторять бессмысленно.
+                            raise error
+
+                        last_err = error
+
+                        if 500 <= status < 600:
                             self._circuit.record_failure()
-                            raise RuntimeError(
-                                f"Jira server error {resp.status}: {text[:300]}"
+
+                        if attempt >= retries:
+                            break
+
+                        # Jira может вернуть Retry-After при 429.
+                        retry_after = resp.headers.get(
+                            "Retry-After"
+                        )
+
+                        try:
+                            delay = (
+                                float(retry_after)
+                                if retry_after
+                                else 2 ** (attempt - 1)
                             )
+                        except ValueError:
+                            delay = 2 ** (attempt - 1)
 
-                        self._circuit.record_success()
-                        logger.debug(f"jira: {method} {endpoint} → {resp.status}")
-                        return resp.status, text
+                        logger.warning(
+                            "jira: HTTP %s, попытка %s/%s. "
+                            "Повтор через %.1f сек.",
+                            status,
+                            attempt,
+                            retries,
+                            delay,
+                        )
 
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last_err = e
-                wait = 2 ** attempt
+                        await asyncio.sleep(delay)
+
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as error:
+                last_err = error
+                self._circuit.record_failure()
+
+                if attempt >= retries:
+                    break
+
+                delay = 2 ** (attempt - 1)
+
                 logger.warning(
-                    f"jira: попытка {attempt + 1}/{retries} провалилась "
-                    f"({type(e).__name__}), ждём {wait}с"
+                    "jira: попытка %s/%s провалилась "
+                    "(%s). Повтор через %s сек.",
+                    attempt,
+                    retries,
+                    type(error).__name__,
+                    delay,
                 )
-                await asyncio.sleep(wait)
 
-            except RuntimeError:
-                raise
+                await asyncio.sleep(delay)
 
-        raise RuntimeError(f"Jira недоступна после {retries} попыток: {last_err}")
+        raise RuntimeError(
+            f"Jira недоступна после {retries} попыток: "
+            f"{last_err}"
+        )
 
     async def _search(
         self,
