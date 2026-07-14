@@ -1,7 +1,7 @@
 """SQLite state management for clarification sessions and ticket tracking."""
 import sqlite3
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from config import CONFIG
 
@@ -156,18 +156,18 @@ class StateManager:
     ) -> List[str]:
         """
         Возвращает последние тикеты, созданные конкретным пользователем.
-    
+
         Username хранится в нормализованном lowercase-виде.
         """
         normalized_username = (
             username or ""
         ).lstrip("@").lower()
-    
+
         if not normalized_username:
             return []
-    
+
         safe_limit = max(1, min(int(limit), 50))
-    
+
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 """
@@ -182,7 +182,7 @@ class StateManager:
                     safe_limit,
                 ),
             ).fetchall()
-    
+
         return [
             row[0]
             for row in rows
@@ -306,45 +306,76 @@ class StateManager:
 
     # ── Stats ──────────────────────────────────────────────────────────────
     def get_local_stats(self) -> Dict[str, Any]:
+        """
+        Возвращает локальную статистику за последние 30 дней.
+        """
         now = datetime.now(timezone.utc)
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-
+    
+        period_start = (
+            now - timedelta(days=30)
+        ).isoformat()
+    
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-
+    
             total = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tracked_tickets"
-            ).fetchone()["cnt"]
-
-            this_month = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tracked_tickets WHERE created_at >= ?",
-                (month_start,)
-            ).fetchone()["cnt"]
-
-            top_users = conn.execute(
-                """SELECT username, COUNT(*) as cnt
+                """
+                SELECT COUNT(*) AS cnt
                 FROM tracked_tickets
-                WHERE username IS NOT NULL AND username != ''
+                """
+            ).fetchone()["cnt"]
+    
+            last_30_days = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM tracked_tickets
+                WHERE created_at >= ?
+                """,
+                (period_start,),
+            ).fetchone()["cnt"]
+    
+            top_users = conn.execute(
+                """
+                SELECT username, COUNT(*) AS cnt
+                FROM tracked_tickets
+                WHERE created_at >= ?
+                  AND username IS NOT NULL
+                  AND username != ''
                 GROUP BY username
                 ORDER BY cnt DESC
-                LIMIT 5"""
+                LIMIT 5
+                """,
+                (period_start,),
             ).fetchall()
-
+    
             failed = conn.execute(
-                "SELECT COUNT(*) as cnt FROM failed_requests"
+                """
+                SELECT COUNT(*) AS cnt
+                FROM failed_requests
+                """
             ).fetchone()["cnt"]
-
-            failed_month = conn.execute(
-                "SELECT COUNT(*) as cnt FROM failed_requests WHERE created_at >= ?",
-                (month_start,)
+    
+            failed_30_days = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM failed_requests
+                WHERE created_at >= ?
+                """,
+                (period_start,),
             ).fetchone()["cnt"]
-
+    
         return {
-            "total":       total,
-            "this_month":  this_month,
-            "top_users":   [{"username": r["username"], "count": r["cnt"]} for r in top_users],
-            "failed":      failed,
-            "failed_month": failed_month,
+            "total": total,
+            "last_30_days": last_30_days,
+            "top_users": [
+                {
+                    "username": row["username"],
+                    "count": row["cnt"],
+                }
+                for row in top_users
+            ],
+            "failed": failed,
+            "failed_30_days": failed_30_days,
         }
 
 
