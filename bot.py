@@ -1229,6 +1229,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_comment(update, chat_id, text, username, session)
         return
 
+    if session and session["state"] == "awaiting_confirmation":
+        await update.message.reply_text(
+            "⚠️ У тебя уже есть неподтверждённое превью тикета.\n\n"
+            "Сначала выбери действие:\n"
+            "✅ создать тикет;\n"
+            "✏️ уточнить текущий запрос;\n"
+            "❌ отменить его.",
+            reply_markup=_preview_keyboard(),
+        )
+        return
     logger.info(f"request_received chat_id={chat_id} msg_len={len(text)}")
     STATE_MANAGER.create_session(chat_id, text)
     await _process_request(update, chat_id, text, username, collected_answers=[])
