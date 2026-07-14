@@ -55,6 +55,14 @@ class StateManager:
                     UNIQUE(issue_key, alert_type)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS admin_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            """)
             conn.commit()
 
     # ── Sessions ──────────────────────────────────────────────────────────
@@ -170,6 +178,62 @@ class StateManager:
             conn.execute("DELETE FROM tracked_tickets WHERE issue_key = ?", (issue_key,))
             conn.execute("DELETE FROM sent_alerts WHERE issue_key = ?", (issue_key,))
             conn.commit()
+
+    # ── Admin chats ─────────────────────────────────────────────────────────
+    def register_admin_chat(self, chat_id: int, username: str) -> None:
+        """
+        Сохраняет Telegram chat_id администратора.
+
+        Запись создаётся или обновляется, когда администратор
+        запускает бота через команду /start.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        normalized_username = (username or "").lstrip("@").lower()
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO admin_chats (
+                    chat_id,
+                    username,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    username = excluded.username,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    chat_id,
+                    normalized_username,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def get_registered_admin_chats(self) -> List[Dict[str, Any]]:
+        """
+        Возвращает сохранённые Telegram-чаты администраторов.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT chat_id, username
+                FROM admin_chats
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+
+            return [
+                {
+                    "chat_id": row["chat_id"],
+                    "username": row["username"],
+                }
+                for row in rows
+            ]
 
     # ── SLA alerts ─────────────────────────────────────────────────────────
     def was_alert_sent(self, issue_key: str, alert_type: str) -> bool:
