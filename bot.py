@@ -1540,14 +1540,29 @@ async def _create_raw_ticket(update, chat_id, text, username, error_msg):
             f"Запрос сохранён в журнале ошибок.\n"
             f"{_escape_md(str(e)[:200])}"
         )
+async def _post_shutdown(
+    application: Application,
+) -> None:
+    """
+    Закрывает внешние HTTP-ресурсы
+    при остановке Telegram-бота.
+    """
+    await JIRA_CLIENT.close()
+
+    logger.info(
+        "TeamTrustGate resources closed"
+    )
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
     app = (
         Application.builder()
         .token(CONFIG.TELEGRAM_TOKEN)
-        .defaults(Defaults(parse_mode="Markdown"))
+        .defaults(
+            Defaults(parse_mode="Markdown")
+        )
         .concurrent_updates(False)
+        .post_shutdown(_post_shutdown)
         .build()
     )
 
@@ -1574,6 +1589,7 @@ def main():
 
     logger.info("TeamTrustGate bot starting...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
