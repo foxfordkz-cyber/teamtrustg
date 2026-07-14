@@ -15,7 +15,6 @@ matplotlib.use("Agg")  # без GUI — для сервера
 import matplotlib.pyplot as plt
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes, Defaults
@@ -181,21 +180,8 @@ def _build_jira_description(analysis: dict, scoring: dict, raw_text: str, reques
 def _safe_confidence(analysis: dict) -> float:
     return parse_llm_number(analysis.get("confidence", 0))
 
-def _escape_md(text: object) -> str:
-    """
-    Экранирует динамический текст для Telegram Markdown v1.
-
-    Защищает сообщения от символов _, *, ` и [,
-    которые могут находиться в названиях тикетов,
-    статусах, ошибках и ответах LLM.
-    """
-    if text is None:
-        return ""
-
-    return escape_markdown(
-        str(text),
-        version=1,
-    )
+def _escape_md(text: str) -> str:
+    return str(text) if text else ""
 
 def _priority_emoji(priority: str) -> str:
     return {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}.get(priority, "⚪")
@@ -973,7 +959,9 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("📊 Собираю статистику...")
 
-    local = STATE_MANAGER.get_local_stats()
+    local = await asyncio.to_thread(
+        STATE_MANAGER.get_local_stats
+    )
     try:
         jira = await JIRA_CLIENT.get_project_stats(days=30)
     except Exception as e:
@@ -989,7 +977,10 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]])
 
     # Пробуем сгенерировать график и отправить картинкой с текстом в подписи
-    chart = _generate_stats_chart(jira)
+    chart = await asyncio.to_thread(
+        _generate_stats_chart,
+        jira,
+    )
     if chart:
         # Подпись к фото ограничена 1024 символами — если текст длиннее, шлём отдельно
         if len(stats_text) <= 1024:
