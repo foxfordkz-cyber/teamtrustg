@@ -43,7 +43,10 @@ class Deduplicator:
         1. Батч-сравнение через LLM (по BATCH_SIZE тикетов за раз)
         2. Если LLM недоступен — keyword fallback (Jaccard similarity)
         """
-        candidates = await JIRA_CLIENT.search_recent_issues(days=CONFIG.DEDUP_DAYS)
+        candidates = await JIRA_CLIENT.search_recent_issues(
+            days=CONFIG.DEDUP_DAYS,
+            max_results=CONFIG.DEDUP_MAX_RESULTS,
+        )
         if not candidates:
             logger.info("dedup: нет кандидатов в бэклоге")
             return None
