@@ -19,6 +19,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes, Defaults
 )
+from telegram.helpers import escape_markdown
 
 from config import CONFIG, Config
 from state_manager import STATE_MANAGER
@@ -180,8 +181,14 @@ def _build_jira_description(analysis: dict, scoring: dict, raw_text: str, reques
 def _safe_confidence(analysis: dict) -> float:
     return parse_llm_number(analysis.get("confidence", 0))
 
-def _escape_md(text: str) -> str:
-    return str(text) if text else ""
+def _escape_md(text: object) -> str:
+    if text is None:
+        return ""
+
+    return escape_markdown(
+        str(text),
+        version=1,
+    )
 
 def _priority_emoji(priority: str) -> str:
     return {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}.get(priority, "⚪")
