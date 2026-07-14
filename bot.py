@@ -741,7 +741,7 @@ async def start_handler(
         else "👤 Роль: *Сейлз*"
     )
 
-    
+
 
 
 
@@ -810,39 +810,124 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Не удалось получить статус: {_escape_md(str(e)[:200])}"
         )
 
-async def list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     user = update.effective_user
+
     if not _is_allowed(user.username or ""):
-        await update.message.reply_text("❌ Доступ ограничен.")
-        return
-    username = user.username or user.first_name or str(user.id)
-    await update.message.reply_text("🔍 Ищу твои последние тикеты...")
-    try:
-        issues = await JIRA_CLIENT.search_user_issues(username, max_results=5)
-    except Exception as e:
         await update.message.reply_text(
-            f"❌ Не удалось получить тикеты: {_escape_md(str(e)[:200])}"
+            "❌ Доступ ограничен."
         )
         return
+
+    username = (
+        user.username
+        or user.first_name
+        or str(user.id)
+    )
+
+    is_admin = _is_admin(user.username or "")
+
+    if is_admin:
+        await update.message.reply_text(
+            "🔍 Ищу последние тикеты проекта..."
+        )
+
+        try:
+            issues = (
+                await JIRA_CLIENT.search_recent_project_issues(
+                    max_results=5,
+                )
+            )
+
+        except Exception as error:
+            logger.warning(
+                "list: ошибка получения тикетов проекта: %s",
+                error,
+            )
+
+            await update.message.reply_text(
+                "❌ Не удалось получить список тикетов."
+            )
+            return
+
+        title = "📋 *Последние тикеты проекта:*"
+
+    else:
+        await update.message.reply_text(
+            "🔍 Ищу твои последние тикеты..."
+        )
+
+        ticket_keys = (
+            STATE_MANAGER.get_user_ticket_keys(
+                username=_norm(username),
+                limit=5,
+            )
+        )
+
+        if not ticket_keys:
+            await update.message.reply_text(
+                "📭 У тебя пока нет тикетов, созданных через бота."
+            )
+            return
+
+        try:
+            issues = await JIRA_CLIENT.search_issues_by_keys(
+                ticket_keys
+            )
+
+        except Exception as error:
+            logger.warning(
+                "list: ошибка получения пользовательских тикетов: %s",
+                error,
+            )
+
+            await update.message.reply_text(
+                "❌ Не удалось получить твои тикеты."
+            )
+            return
+
+        title = "📋 *Твои последние тикеты:*"
+
     if not issues:
-        await update.message.reply_text("📭 Тикетов не найдено.")
-        return
-    lines = ["📋 *Твои последние тикеты:*\n"]
-    for i in issues:
-        emoji = _priority_emoji(i.get("priority", "Low"))
-        lines.append(
-            f"{emoji} [{i['key']}]({CONFIG.JIRA_URL}/browse/{i['key']}) — "
-            f"{_escape_md(i['summary'][:60])}\n"
-            f"   Статус: _{_escape_md(i.get('status', '—'))}_"
+        await update.message.reply_text(
+            "📭 Тикетов не найдено."
         )
-    await update.message.reply_text(
-        "\n\n".join(lines),
-        reply_markup=InlineKeyboardMarkup([[
+        return
+
+    lines = [title]
+
+    for issue in issues:
+        issue_key = issue.get("key", "")
+        summary = issue.get("summary", "")
+        status = issue.get("status", "—")
+        priority = issue.get("priority", "Low")
+
+        lines.append(
+            f"{_priority_emoji(priority)} "
+            f"[{issue_key}]"
+            f"({CONFIG.JIRA_URL}/browse/{issue_key}) — "
+            f"{_escape_md(summary[:60])}\n"
+            f"   Статус: _{_escape_md(status)}_"
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        [[
             InlineKeyboardButton(
                 "🔗 Открыть проект в Jira",
-                url=f"{CONFIG.JIRA_URL}/projects/{CONFIG.JIRA_PROJECT_KEY}"
+                url=(
+                    f"{CONFIG.JIRA_URL}/projects/"
+                    f"{CONFIG.JIRA_PROJECT_KEY}"
+                ),
             )
-        ]])
+        ]]
+    )
+
+    await update.message.reply_text(
+        "\n\n".join(lines),
+        reply_markup=keyboard,
     )
 
 async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
