@@ -396,15 +396,20 @@ class JiraClient:
         logger.info(f"jira: тикет создан {key}" + (f" (due {due_date})" if due_date else ""))
         return {"key": key, "url": url}
 
-    async def delete_issue(self, issue_key: str) -> None:
-        try:
-            await self._request("DELETE", f"/issue/{issue_key}")
-        except RuntimeError as e:
-            if "204" in str(e):
-                pass
-            else:
-                raise
-        logger.info(f"jira: тикет удалён {issue_key}")
+    async def delete_issue(
+        self,
+        issue_key: str,
+    ) -> None:
+        """Удаляет тикет из Jira."""
+        await self._request(
+            "DELETE",
+            f"/issue/{issue_key}",
+        )
+
+        logger.info(
+            "jira: тикет удалён %s",
+            issue_key,
+        )
 
     async def add_comment(self, issue_key: str, comment: str) -> None:
         await self._request("POST", f"/issue/{issue_key}/comment", {"body": comment})
