@@ -90,7 +90,28 @@ def _is_admin(username: str) -> bool:
     if not CONFIG.ADMIN_USERNAMES:
         return False  # список пуст — никто не админ
     return _norm(username) in CONFIG.ADMIN_USERNAMES
+def _can_access_ticket(
+    username: str,
+    issue_key: str,
+) -> bool:
+    """
+    Проверяет доступ пользователя к тикету.
 
+    Администратор может работать с любым тикетом.
+    Обычный пользователь — только со своим тикетом,
+    созданным через этого бота.
+    """
+    if _is_admin(username):
+        return True
+
+    owner = STATE_MANAGER.get_ticket_owner(
+        issue_key
+    )
+
+    if not owner:
+        return False
+
+    return owner == _norm(username)
 # ── Keyboard builders ─────────────────────────────────────────────────────
 def _ticket_keyboard(issue_key: str, is_admin: bool = False) -> InlineKeyboardMarkup:
     """
@@ -598,6 +619,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("status:"):
         issue_key = data.split(":", 1)[1]
+
+        if not _can_access_ticket(
+            username,
+            issue_key,
+        ):
+            await query.message.reply_text(
+                "❌ У тебя нет доступа к этому тикету."
+            )
+            return
+
         try:
             _, text = await JIRA_CLIENT._request(
                 "GET", f"/issue/{issue_key}?fields=status,summary,priority"
@@ -653,16 +684,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("✅ Удаление отменено.")
 
     elif data.startswith("comment:"):
-        issue_key = data.split(":", 1)[1]
-        # Запоминаем в сессии что ждём текст комментария к этому тикету
-        STATE_MANAGER.create_session(chat_id, "")
-        STATE_MANAGER.update_session(
-            chat_id, "awaiting_comment", [], 0, {"comment_issue_key": issue_key}
-        )
-        await query.message.reply_text(
-            f"💬 Напиши комментарий к тикету *{issue_key}* — я добавлю его в Jira.\n"
-            f"_Для отмены — /cancel_"
-        )
+           issue_key = data.split(":", 1)[1]
+
+           if not _can_access_ticket(
+               username,
+               issue_key,
+           ):
+               await query.message.reply_text(
+                   "❌ Ты не можешь добавлять комментарии "
+                   "к чужому тикету."
+               )
+               return
+
+           # Запоминаем, что бот ждёт текст комментария.
+           STATE_MANAGER.create_session(
+               chat_id,
+               "",
+           )
+
+           STATE_MANAGER.update_session(
+               chat_id,
+               "awaiting_comment",
+               [],
+               0,
+               {
+                   "comment_issue_key": issue_key,
+               },
+           )
+
+           await query.message.reply_text(
+               f"💬 Напиши комментарий к тикету "
+               f"*{issue_key}* — я добавлю его в Jira.\n"
+               f"_Для отмены — /cancel_"
+           )
 
 async def _handle_transition(query, issue_key: str, transition_type: str, username: str):
     try:
@@ -797,6 +851,16 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /status TT-42")
         return
     issue_key = args[0].upper()
+
+    if not _can_access_ticket(
+        username,
+        issue_key,
+    ):
+        await update.message.reply_text(
+            "❌ У тебя нет доступа к этому тикету."
+        )
+        return
+
     try:
         _, text = await JIRA_CLIENT._request(
             "GET", f"/issue/{issue_key}?fields=status,summary,priority"
@@ -1260,6 +1324,16 @@ async def _handle_comment(update, chat_id, text, username, session):
         STATE_MANAGER.clear_session(chat_id)
         await update.message.reply_text("⚠️ Не понял к какому тикету комментарий. Попробуй ещё раз.")
         return
+    if not _can_access_ticket(
+        username,
+        issue_key,
+    ):
+        STATE_MANAGER.clear_session(chat_id)
+
+        await update.message.reply_text(
+            "❌ У тебя нет доступа к этому тикету."
+        )
+        return
 
     await update.message.reply_text("💬 Добавляю комментарий...")
 
@@ -1462,7 +1536,9 @@ async def _create_raw_ticket(update, chat_id, text, username, error_msg):
         STATE_MANAGER.save_failed_request(chat_id, username, text, None, str(e))
         STATE_MANAGER.clear_session(chat_id)
         await update.message.reply_text(
-            f"❌ Не удалось создать тикет. Админ уведомлён.\n{_escape_md(str(e)[:200])}"
+            f"❌ Не удалось создать тикет. "
+            f"Запрос сохранён в журнале ошибок.\n"
+            f"{_escape_md(str(e)[:200])}"
         )
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -1471,7 +1547,7 @@ def main():
         Application.builder()
         .token(CONFIG.TELEGRAM_TOKEN)
         .defaults(Defaults(parse_mode="Markdown"))
-        .concurrent_updates(True)
+        .concurrent_updates(False)
         .build()
     )
 
