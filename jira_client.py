@@ -133,22 +133,103 @@ class JiraClient:
 
         raise RuntimeError(f"Jira недоступна после {retries} попыток: {last_err}")
 
-    async def _search(self, jql: str, fields: List[str], max_results: int = 50) -> List[Dict[str, Any]]:
+    async def _search(
+        self,
+        jql: str,
+        fields: List[str],
+        max_results: int = 50,
+    ) -> List[Dict[str, Any]]:
         """
-        Поиск через новый эндпоинт /rest/api/3/search/jql.
-        Поля и JQL передаются в теле POST-запроса (не в URL).
-        Возвращает список issues.
+        Выполняет JQL-поиск с поддержкой пагинации nextPageToken.
+
+        max_results — максимальное общее количество тикетов,
+        которое должен вернуть метод со всех страниц.
         """
-        payload = {
-            "jql": jql,
-            "fields": fields,
-            "maxResults": max_results,
-        }
-        status, text = await self._request(
-            "POST", "/search/jql", json_data=payload, base=self.search_base
-        )
-        data = json.loads(text)
-        return data.get("issues", [])
+        total_limit = max(0, int(max_results))
+
+        if total_limit == 0:
+            return []
+
+        issues: List[Dict[str, Any]] = []
+
+        next_page_token: Optional[str] = None
+        seen_tokens: set[str] = set()
+
+        # Не запрашиваем слишком большую страницу за один раз.
+        page_size = min(total_limit, 100)
+
+        while len(issues) < total_limit:
+            remaining = total_limit - len(issues)
+
+            payload: Dict[str, Any] = {
+                "jql": jql,
+                "fields": fields,
+                "maxResults": min(page_size, remaining),
+            }
+
+            if next_page_token:
+                payload["nextPageToken"] = next_page_token
+
+            _, text = await self._request(
+                "POST",
+                "/search/jql",
+                json_data=payload,
+                base=self.search_base,
+            )
+
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    "Jira вернула некорректный JSON "
+                    "при выполнении JQL-поиска"
+                ) from error
+
+            page_issues = data.get("issues", [])
+
+            if not isinstance(page_issues, list):
+                raise RuntimeError(
+                    "Jira вернула некорректное поле issues"
+                )
+
+            issues.extend(page_issues)
+
+            is_last = bool(data.get("isLast", False))
+            new_token = data.get("nextPageToken")
+
+            logger.debug(
+                "jira search: получено %s, всего %s/%s, isLast=%s",
+                len(page_issues),
+                len(issues),
+                total_limit,
+                is_last,
+            )
+
+            # Последняя страница или Jira не вернула следующий токен.
+            if is_last or not new_token:
+                break
+
+            # Защита от бесконечного цикла,
+            # если Jira повторно вернула тот же токен.
+            if new_token in seen_tokens:
+                logger.warning(
+                    "jira search: повторный nextPageToken, "
+                    "пагинация остановлена"
+                )
+                break
+
+            # Пустая страница с токеном тоже не должна создавать цикл.
+            if not page_issues:
+                logger.warning(
+                    "jira search: получена пустая страница, "
+                    "пагинация остановлена"
+                )
+                break
+
+            seen_tokens.add(new_token)
+            next_page_token = new_token
+
+        return issues[:total_limit]
 
     async def search_recent_issues(
         self,
