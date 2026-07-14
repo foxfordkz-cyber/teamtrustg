@@ -16,6 +16,7 @@ from config import CONFIG
 
 logger = logging.getLogger("teamtrustgate")
 
+_NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 410}
 
 _PRIORITY_MAP = {
     "Highest": "Highest",
@@ -72,44 +73,6 @@ class JiraClient:
             "Accept": "application/json",
         }
         self._circuit = CircuitBreaker()
-        self._session: Optional[aiohttp.ClientSession] = None
-    async def _get_session(
-        self,
-    ) -> aiohttp.ClientSession:
-        if (
-            self._session is None
-            or self._session.closed
-        ):
-            self._session = aiohttp.ClientSession(
-                headers=self._headers,
-                timeout=aiohttp.ClientTimeout(
-                    total=CONFIG.JIRA_TIMEOUT
-                ),
-                connector=aiohttp.TCPConnector(
-                    limit=20,
-                    ttl_dns_cache=300,
-                ),
-            )
-
-            logger.info(
-                "jira: общая HTTP-сессия создана"
-            )
-
-        return self._session
-
-
-    async def close(self) -> None:
-        if (
-            self._session is not None
-            and not self._session.closed
-        ):
-            await self._session.close()
-
-            logger.info(
-                "jira: HTTP-сессия закрыта"
-            )
-
-        self._session = None
 
     async def _request(
         self,
@@ -120,285 +83,95 @@ class JiraClient:
         base: Optional[str] = None,
     ) -> tuple[int, str]:
         """
-        Выполняет HTTP-запрос к Jira.
-
-        Повторяются:
-        - сетевые ошибки;
-        - timeout;
-        - HTTP 429;
-        - HTTP 5xx.
-
-        Остальные HTTP 4xx считаются постоянными ошибками
-        и не повторяются.
+        Универсальный запрос к Jira.
+        base — переопределение base_url (для поиска используем search_base).
         """
         if self._circuit.is_open():
             raise RuntimeError(
-                "Jira circuit breaker активен — "
-                "сервис временно недоступен. "
+                "Jira circuit breaker активен — сервис временно недоступен. "
                 "Попробуйте через несколько минут."
             )
 
         url = f"{base or self.base_url}{endpoint}"
         last_err: Optional[Exception] = None
 
-        for attempt in range(1, retries + 1):
+        for attempt in range(retries):
             try:
-                session = await self._get_session()
-
-                async with session.request(
-                    method,
-                    url,
-                    json=json_data,
-                ) as resp:
+                timeout = aiohttp.ClientTimeout(total=CONFIG.JIRA_TIMEOUT)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.request(
+                        method, url, headers=self._headers, json=json_data
+                    ) as resp:
                         text = await resp.text()
-                        status = resp.status
 
-                        # Любой успешный HTTP-ответ.
-                        if 200 <= status < 300:
-                            self._circuit.record_success()
-
-                            logger.debug(
-                                "jira: %s %s → %s",
-                                method,
-                                endpoint,
-                                status,
+                        if resp.status in _NON_RETRYABLE_STATUSES:
+                            raise RuntimeError(
+                                f"Jira {resp.status}: {_status_message(resp.status, text)}"
                             )
 
-                            return status, text
-
-                        error = RuntimeError(
-                            f"Jira {status}: "
-                            f"{_status_message(status, text)}"
-                        )
-
-                        # 429 и 5xx считаются временными.
-                        is_retryable = (
-                            status == 429
-                            or 500 <= status < 600
-                        )
-
-                        if not is_retryable:
-                            # 400, 401, 403, 404, 409,
-                            # 410, 422 и остальные 4xx
-                            # повторять бессмысленно.
-                            raise error
-
-                        last_err = error
-
-                        if 500 <= status < 600:
+                        if 500 <= resp.status < 600:
                             self._circuit.record_failure()
-
-                        if attempt >= retries:
-                            break
-
-                        # Jira может вернуть Retry-After при 429.
-                        retry_after = resp.headers.get(
-                            "Retry-After"
-                        )
-
-                        try:
-                            delay = (
-                                float(retry_after)
-                                if retry_after
-                                else 2 ** (attempt - 1)
+                            raise RuntimeError(
+                                f"Jira server error {resp.status}: {text[:300]}"
                             )
-                        except ValueError:
-                            delay = 2 ** (attempt - 1)
 
-                        logger.warning(
-                            "jira: HTTP %s, попытка %s/%s. "
-                            "Повтор через %.1f сек.",
-                            status,
-                            attempt,
-                            retries,
-                            delay,
-                        )
+                        self._circuit.record_success()
+                        logger.debug(f"jira: {method} {endpoint} → {resp.status}")
+                        return resp.status, text
 
-                        await asyncio.sleep(delay)
-
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-            ) as error:
-                last_err = error
-                self._circuit.record_failure()
-
-                if attempt >= retries:
-                    break
-
-                delay = 2 ** (attempt - 1)
-
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_err = e
+                wait = 2 ** attempt
                 logger.warning(
-                    "jira: попытка %s/%s провалилась "
-                    "(%s). Повтор через %s сек.",
-                    attempt,
-                    retries,
-                    type(error).__name__,
-                    delay,
+                    f"jira: попытка {attempt + 1}/{retries} провалилась "
+                    f"({type(e).__name__}), ждём {wait}с"
                 )
+                await asyncio.sleep(wait)
 
-                await asyncio.sleep(delay)
+            except RuntimeError:
+                raise
 
-        raise RuntimeError(
-            f"Jira недоступна после {retries} попыток: "
-            f"{last_err}"
+        raise RuntimeError(f"Jira недоступна после {retries} попыток: {last_err}")
+
+    async def _search(self, jql: str, fields: List[str], max_results: int = 50) -> List[Dict[str, Any]]:
+        """
+        Поиск через новый эндпоинт /rest/api/3/search/jql.
+        Поля и JQL передаются в теле POST-запроса (не в URL).
+        Возвращает список issues.
+        """
+        payload = {
+            "jql": jql,
+            "fields": fields,
+            "maxResults": max_results,
+        }
+        status, text = await self._request(
+            "POST", "/search/jql", json_data=payload, base=self.search_base
         )
-
-    async def _search(
-        self,
-        jql: str,
-        fields: List[str],
-        max_results: int = 50,
-    ) -> List[Dict[str, Any]]:
-        """
-        Выполняет JQL-поиск с поддержкой пагинации nextPageToken.
-
-        max_results — максимальное общее количество тикетов,
-        которое должен вернуть метод со всех страниц.
-        """
-        total_limit = max(0, int(max_results))
-
-        if total_limit == 0:
-            return []
-
-        issues: List[Dict[str, Any]] = []
-
-        next_page_token: Optional[str] = None
-        seen_tokens: set[str] = set()
-
-        # Не запрашиваем слишком большую страницу за один раз.
-        page_size = min(total_limit, 100)
-
-        while len(issues) < total_limit:
-            remaining = total_limit - len(issues)
-
-            payload: Dict[str, Any] = {
-                "jql": jql,
-                "fields": fields,
-                "maxResults": min(page_size, remaining),
-            }
-
-            if next_page_token:
-                payload["nextPageToken"] = next_page_token
-
-            _, text = await self._request(
-                "POST",
-                "/search/jql",
-                json_data=payload,
-                base=self.search_base,
-            )
-
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError as error:
-                raise RuntimeError(
-                    "Jira вернула некорректный JSON "
-                    "при выполнении JQL-поиска"
-                ) from error
-
-            page_issues = data.get("issues", [])
-
-            if not isinstance(page_issues, list):
-                raise RuntimeError(
-                    "Jira вернула некорректное поле issues"
-                )
-
-            issues.extend(page_issues)
-
-            is_last = bool(data.get("isLast", False))
-            new_token = data.get("nextPageToken")
-
-            logger.debug(
-                "jira search: получено %s, всего %s/%s, isLast=%s",
-                len(page_issues),
-                len(issues),
-                total_limit,
-                is_last,
-            )
-
-            # Последняя страница или Jira не вернула следующий токен.
-            if is_last or not new_token:
-                break
-
-            # Защита от бесконечного цикла,
-            # если Jira повторно вернула тот же токен.
-            if new_token in seen_tokens:
-                logger.warning(
-                    "jira search: повторный nextPageToken, "
-                    "пагинация остановлена"
-                )
-                break
-
-            # Пустая страница с токеном тоже не должна создавать цикл.
-            if not page_issues:
-                logger.warning(
-                    "jira search: получена пустая страница, "
-                    "пагинация остановлена"
-                )
-                break
-
-            seen_tokens.add(new_token)
-            next_page_token = new_token
-
-        return issues[:total_limit]
+        data = json.loads(text)
+        return data.get("issues", [])
 
     async def search_recent_issues(
         self,
         days: int = CONFIG.DEDUP_DAYS,
-        max_results: int = 200,
+        max_results: int = 50,
     ) -> List[Dict[str, Any]]:
-        """
-        Возвращает недавние открытые тикеты проекта
-        для проверки дубликатов.
-
-        По умолчанию анализируется до 200 тикетов.
-        """
-        safe_limit = max(
-            1,
-            min(int(max_results), 500),
-        )
-
+        """Недавние открытые тикеты проекта для дедупликации."""
         jql = (
             f"project={CONFIG.JIRA_PROJECT_KEY} "
             f"AND created >= -{days}d "
-            f"AND statusCategory != Done "
+            f"AND status != Done "
             f"ORDER BY created DESC"
         )
-
-        issues = await self._search(
-            jql,
-            [
-                "summary",
-                "description",
-                "key",
-            ],
-            safe_limit,
-        )
-
+        issues = await self._search(jql, ["summary", "description", "key"], max_results)
         result = [
             {
-                "key": issue.get("key", ""),
-                "summary": (
-                    issue.get("fields") or {}
-                ).get("summary", ""),
-                "description": self._extract_desc(
-                    (issue.get("fields") or {}).get(
-                        "description"
-                    )
-                ),
+                "key": i["key"],
+                "summary": i["fields"].get("summary", ""),
+                "description": self._extract_desc(i["fields"].get("description")),
             }
-            for issue in issues
+            for i in issues
         ]
-
-        logger.info(
-            "jira: для дедупликации получено "
-            "%s тикетов за последние %s дней "
-            "(лимит=%s)",
-            len(result),
-            days,
-            safe_limit,
-        )
-
+        logger.info(f"jira: найдено {len(result)} тикетов за последние {days} дней")
         return result
 
     async def search_recent_project_issues(
@@ -623,20 +396,15 @@ class JiraClient:
         logger.info(f"jira: тикет создан {key}" + (f" (due {due_date})" if due_date else ""))
         return {"key": key, "url": url}
 
-    async def delete_issue(
-        self,
-        issue_key: str,
-    ) -> None:
-        """Удаляет тикет из Jira."""
-        await self._request(
-            "DELETE",
-            f"/issue/{issue_key}",
-        )
-
-        logger.info(
-            "jira: тикет удалён %s",
-            issue_key,
-        )
+    async def delete_issue(self, issue_key: str) -> None:
+        try:
+            await self._request("DELETE", f"/issue/{issue_key}")
+        except RuntimeError as e:
+            if "204" in str(e):
+                pass
+            else:
+                raise
+        logger.info(f"jira: тикет удалён {issue_key}")
 
     async def add_comment(self, issue_key: str, comment: str) -> None:
         await self._request("POST", f"/issue/{issue_key}/comment", {"body": comment})
